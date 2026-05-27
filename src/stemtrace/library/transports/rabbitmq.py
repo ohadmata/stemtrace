@@ -199,6 +199,12 @@ class RabbitMQTransport:
                 except Exception:
                     logger.debug("Failed to reject malformed RabbitMQ message")
 
+        # Reconnect backoff: grows exponentially while failing, resets on success.
+        # Without this, a broker outage produces one ERROR-level traceback per second.
+        backoff = 1.0
+        max_backoff = 30.0
+        consecutive_failures = 0
+
         while True:
             try:
                 with Connection(self._url) as conn:
@@ -214,6 +220,14 @@ class RabbitMQTransport:
                         callbacks=[on_message],
                         accept=["json"],
                     ):
+                        if consecutive_failures:
+                            logger.info(
+                                "RabbitMQ consume loop reconnected after %d failure(s)",
+                                consecutive_failures,
+                            )
+                        consecutive_failures = 0
+                        backoff = 1.0
+
                         while True:
                             # Periodic wakeup to allow outer loops to run.
                             with contextlib.suppress(TimeoutError, socket.timeout):
@@ -221,9 +235,26 @@ class RabbitMQTransport:
 
                             while pending:
                                 yield pending.popleft()
-            except Exception:
-                logger.exception("RabbitMQ consume loop error")
-                time.sleep(1)
+            except Exception as exc:
+                consecutive_failures += 1
+                # Log full traceback only on the first failure of a run, then a
+                # single warning line per subsequent attempt to avoid log floods.
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "RabbitMQ consume loop error; retrying in %.1fs",
+                        backoff,
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "RabbitMQ consume loop still failing (attempt %d): %s; "
+                        "retrying in %.1fs",
+                        consecutive_failures,
+                        exc,
+                        backoff,
+                    )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     @staticmethod
     def _parse_event(payload: Any) -> StreamEvent:
